@@ -10,6 +10,11 @@
 - `etmem-scan-demo`：只读 `/proc/<pid>/idle_pages`，不启动 `etmemd`，不写 swap，用于观测一个实例或进程的冷热分布。
 - `etmem-swap-demo`：启动 `etmemd` 和 `slide` 工程，把合成靶进程的冷匿名页换出，用 `VmRSS` / `VmSwap` / `MemAvailable` 验证效果。
 
+先澄清两个容易混淆的词：
+
+- `sample` / `samples` 是“采样点/采样次数”。例如 `--samples 5` 或 `SCAN_SAMPLES=5` 表示 warmup 之后输出 5 次冷热扫描结果。
+- scan-only demo 不需要 `/etc/etmem` 配置，也不调用 `etmem` 命令，它直接读内核接口 `/proc/<pid>/idle_pages`。swap demo 才会生成 etmem project 配置，并调用 `etmemd`、`etmem obj add`、`etmem project start`。
+
 官方背景参考：
 
 - openEuler etmem 用户指南：<https://docs.openeuler.org/zh/docs/22.03_LTS_SP4/server/memory_storage/etmem/etmem_user_guide.html>
@@ -181,6 +186,14 @@ sudo ./run_etmem_swap_demo.sh
 sudo TOTAL_MB=4096 HOT_MB=128 DURATION_SEC=180 ./run_etmem_swap_demo.sh
 ```
 
+如果希望按常规习惯把 etmem 配置文件放到 `/etc/etmem`，这样跑：
+
+```bash
+sudo CONFIG_DIR=/etc/etmem TOTAL_MB=4096 HOT_MB=128 DURATION_SEC=180 ./run_etmem_swap_demo.sh
+```
+
+说明：etmem 官方示例常把配置放在 `/etc/etmem`，但 `etmem obj add -f <config>` 接收的是配置文件路径，并不要求 demo 必须写死到 `/etc/etmem`。本仓库默认把配置写到 `/tmp/etmem-swap-demo.*/`，便于一次运行一个隔离工作目录；使用 `CONFIG_DIR=/etc/etmem` 时，脚本会把生成的 `etmem-demo-slide-<pid>.conf` 放到 `/etc/etmem`。
+
 可选回读验证：
 
 ```bash
@@ -202,6 +215,44 @@ running    rss=    160 MB  vmswap=    875 MB  memavail=  64870 MB  swapfree=   7
 after      rss=    150 MB  vmswap=    885 MB  memavail=  64880 MB  swapfree=   7307 MB
 
 PASS: etmem swapped cold anonymous pages and lowered target resident memory.
+```
+
+swap demo 实际执行的 etmem 配置类似这样，脚本运行时也会直接打印：
+
+```ini
+[project]
+name=demo_slide
+loop=3
+interval=5
+sleep=10
+sysmem_threshold=100
+swapcache_high_wmark=5
+swapcache_low_wmark=3
+
+[engine]
+name=slide
+project=demo_slide
+
+[task]
+project=demo_slide
+engine=slide
+name=coldmem_demo
+type=pid
+value=<coldmem_target_pid>
+T=1
+max_threads=1
+swap_threshold=0g
+swap_flag=no
+```
+
+脚本实际调用的 etmem 命令是：
+
+```bash
+etmemd -l 0 -s etmem_demo_<script_pid>
+etmem obj add -f <generated_config_file> -s etmem_demo_<script_pid>
+etmem project start -n demo_slide -s etmem_demo_<script_pid>
+etmem project stop -n demo_slide -s etmem_demo_<script_pid>
+etmem obj del -f <generated_config_file> -s etmem_demo_<script_pid>
 ```
 
 ## 4. 第三阶段：迁移到真实实例或 OpenClaw
@@ -304,4 +355,3 @@ RSS 降了但业务抖动：
     ├── coldmem_target.py
     └── run_etmem_swap_demo.sh
 ```
-

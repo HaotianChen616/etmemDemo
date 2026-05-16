@@ -8,6 +8,8 @@
 
 它会启动一个合成靶进程，分配匿名内存，只持续触碰一小段热内存，其余页面保持冷。随后启动 `etmemd`，通过 `slide` 将冷页换出到 swap。
 
+和 scan-only demo 不同，这个 demo 会真正生成 etmem 配置，并调用 `etmemd` / `etmem`。默认配置文件放在 `/tmp/etmem-swap-demo.*/`，也可以用 `CONFIG_DIR=/etc/etmem` 放到标准目录。
+
 ## 1. 前置条件
 
 目标机需要：
@@ -46,6 +48,14 @@ sudo ./run_etmem_swap_demo.sh
 sudo TOTAL_MB=4096 HOT_MB=128 DURATION_SEC=180 ./run_etmem_swap_demo.sh
 ```
 
+使用 `/etc/etmem` 保存本次生成的配置：
+
+```bash
+sudo CONFIG_DIR=/etc/etmem TOTAL_MB=4096 HOT_MB=128 DURATION_SEC=180 ./run_etmem_swap_demo.sh
+```
+
+说明：etmem 官方示例通常把配置放在 `/etc/etmem`，但 `etmem obj add -f <config>` 接收的是配置文件路径。为了让每次 demo 互相隔离，脚本默认写到 `/tmp/etmem-swap-demo.*/`；如果你希望按标准目录留档，设置 `CONFIG_DIR=/etc/etmem` 即可。
+
 可选 refault 验证：
 
 ```bash
@@ -75,6 +85,46 @@ sudo REFAULT_AFTER=1 ./run_etmem_swap_demo.sh
 - `etmemd.log`
 - `coldmem_target.log`
 
+脚本运行时会打印生成的配置文件路径和完整配置内容。
+
+配置示例：
+
+```ini
+[project]
+name=demo_slide
+loop=3
+interval=5
+sleep=10
+sysmem_threshold=100
+swapcache_high_wmark=5
+swapcache_low_wmark=3
+
+[engine]
+name=slide
+project=demo_slide
+
+[task]
+project=demo_slide
+engine=slide
+name=coldmem_demo
+type=pid
+value=<coldmem_target_pid>
+T=1
+max_threads=1
+swap_threshold=0g
+swap_flag=no
+```
+
+实际调用的 etmem 命令：
+
+```bash
+etmemd -l 0 -s etmem_demo_<script_pid>
+etmem obj add -f <generated_config_file> -s etmem_demo_<script_pid>
+etmem project start -n demo_slide -s etmem_demo_<script_pid>
+etmem project stop -n demo_slide -s etmem_demo_<script_pid>
+etmem obj del -f <generated_config_file> -s etmem_demo_<script_pid>
+```
+
 ## 4. 主要参数
 
 ```bash
@@ -89,6 +139,7 @@ ETMEM_T=1                  # 冷页阈值
 ETMEM_MAX_THREADS=1        # etmem task 线程数
 ETMEM_SWAP_THRESHOLD=0g    # 进程阈值，demo 设为容易触发
 REFAULT_AFTER=0            # 是否做回读验证
+CONFIG_DIR=/tmp/...        # etmem 配置目录；可设为 /etc/etmem
 ```
 
 示例：
@@ -177,4 +228,3 @@ RSS 降了但系统性能变差：
 - 换出强度过高
 - 真实业务热页被误换出
 - 先回到 scan-only 阶段，确认冷热窗口
-

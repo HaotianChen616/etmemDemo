@@ -8,6 +8,8 @@
 
 它不启动 `etmemd`，不创建 etmem project，也不写 `/proc/<pid>/swap_pages`。用途是在动手换出之前，先观察某个进程或实例的冷热内存分布。
 
+这里没有 `/etc/etmem` 配置过程是刻意的：scan-only demo 只验证内核扫描接口，不走 etmem 用户态 project 管理。需要 etmem 配置文件的是 `etmem-swap-demo` 这一类会启动 `etmemd` 并执行 project 的场景。
+
 ## 1. 前置条件
 
 目标机需要：
@@ -52,6 +54,8 @@ sudo ./run_etmem_scan_demo.sh
 sudo TOTAL_MB=4096 HOT_MB=128 SCAN_INTERVAL_SEC=15 SCAN_SAMPLES=5 ./run_etmem_scan_demo.sh
 ```
 
+`SCAN_SAMPLES` 的意思是采样次数。例如 `SCAN_SAMPLES=5` 表示 warmup 后输出 5 次扫描结果；每两次扫描之间等待 `SCAN_INTERVAL_SEC` 秒。命令行参数 `--samples 5` 同理。
+
 预期输出形态：
 
 ```text
@@ -82,6 +86,7 @@ sudo python3 ./scan_idle_pages.py \
 
 参数建议：
 
+- `--samples`：输出多少次扫描结果，不是内存页数量。
 - 普通应用进程：先用 `--vma-filter anon`
 - QEMU / VM 进程：先用 `--vma-filter rw-private --min-vma-kb 2048`
 - 想看全部可读映射：使用 `--vma-filter all`
@@ -185,4 +190,3 @@ sudo modprobe etmem_scan
 - 目标进程在观测窗口内没有实际负载
 - 业务流量没有打到该实例
 - 选错 PID
-

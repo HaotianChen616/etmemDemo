@@ -21,9 +21,10 @@ TASK_NAME="coldmem_demo"
 SOCKET_NAME="etmem_demo_$$"
 
 WORKDIR="$(mktemp -d /tmp/etmem-swap-demo.XXXXXX)"
+CONFIG_DIR="${CONFIG_DIR:-$WORKDIR}"
 READY_FILE="$WORKDIR/ready"
 PID_FILE="$WORKDIR/target.pid"
-CONFIG_FILE="$WORKDIR/etmem-slide.conf"
+CONFIG_FILE="$CONFIG_DIR/etmem-demo-slide-$$.conf"
 METRICS_FILE="$WORKDIR/metrics.csv"
 TARGET_LOG="$WORKDIR/coldmem_target.log"
 ETMEMD_LOG="$WORKDIR/etmemd.log"
@@ -130,6 +131,7 @@ wait_for_ready() {
 }
 
 write_config() {
+  mkdir -p "$CONFIG_DIR"
   cat >"$CONFIG_FILE" <<EOF
 [project]
 name=$PROJECT_NAME
@@ -158,6 +160,13 @@ EOF
   chmod 600 "$CONFIG_FILE"
 }
 
+show_config() {
+  echo
+  echo "generated etmem config: $CONFIG_FILE"
+  sed 's/^/  /' "$CONFIG_FILE"
+  echo
+}
+
 start_target() {
   python3 "$SCRIPT_DIR/coldmem_target.py" \
     --total-mb "$TOTAL_MB" \
@@ -172,11 +181,16 @@ start_target() {
 }
 
 start_etmem() {
+  echo "starting etmem daemon: etmemd -l 0 -s $SOCKET_NAME"
   etmemd -l 0 -s "$SOCKET_NAME" >"$ETMEMD_LOG" 2>&1 &
   ETMEMD_PID="$!"
   sleep 2
   kill -0 "$ETMEMD_PID" 2>/dev/null || die "etmemd failed to start; see $ETMEMD_LOG"
+
+  echo "loading etmem config: etmem obj add -f $CONFIG_FILE -s $SOCKET_NAME"
   etmem obj add -f "$CONFIG_FILE" -s "$SOCKET_NAME" >>"$ETMEM_LOG" 2>&1 || die "etmem obj add failed; see $ETMEM_LOG"
+
+  echo "starting etmem project: etmem project start -n $PROJECT_NAME -s $SOCKET_NAME"
   etmem project start -n "$PROJECT_NAME" -s "$SOCKET_NAME" >>"$ETMEM_LOG" 2>&1 || die "etmem project start failed; see $ETMEM_LOG"
 }
 
@@ -229,6 +243,7 @@ main() {
 
   start_target
   write_config
+  show_config
   sample_once "before"
 
   start_etmem
