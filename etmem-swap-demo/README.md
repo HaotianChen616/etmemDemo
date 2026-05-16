@@ -1,100 +1,180 @@
 # etmem swap cold-page demo
 
-This is a minimal piercing test for openEuler etmem `slide`.
-
-It creates one target process that allocates anonymous memory, touches every page once, then keeps only a small hot range active. etmem should identify the inactive pages as cold and swap them out.
-
-## What It Proves
-
-The demo passes only when all of the following are visible:
-
-- target process `VmRSS` drops
-- target process `VmSwap` grows
-- system `MemAvailable` usually rises, allowing for normal Linux noise
-
-This validates the basic path:
+这个 demo 用 openEuler etmem `slide` 策略做最小换出验证：
 
 ```text
-anonymous cold pages -> etmem scan -> etmem swap -> lower resident memory
+冷匿名页 -> etmem scan -> etmem swap -> 进程 VmRSS 下降
 ```
 
-It does not prove OpenClaw performance safety. After this passes, run the same metric style against the real VM or guest process workload.
+它会启动一个合成靶进程，分配匿名内存，只持续触碰一小段热内存，其余页面保持冷。随后启动 `etmemd`，通过 `slide` 将冷页换出到 swap。
 
-## Prerequisites
+## 1. 前置条件
 
-- openEuler kernel with `etmem_scan` and `etmem_swap`
-- `etmem` and `etmemd` installed
-- root privileges
-- enabled swap, preferably zram or NVMe swap for tests
+目标机需要：
 
-Quick checks:
+- openEuler etmem-capable kernel
+- root 权限
+- `python3`
+- `etmem` 和 `etmemd`
+- `etmem_scan` 和 `etmem_swap`
+- 已启用 swap
+
+检查：
 
 ```bash
-command -v etmem etmemd
-modprobe etmem_scan
-modprobe etmem_swap
+command -v etmem
+command -v etmemd
+sudo modprobe etmem_scan
+sudo modprobe etmem_swap
+lsmod | grep etmem
 swapon --show
+grep -E 'SwapTotal|SwapFree' /proc/meminfo
 ```
 
-## Run
+如果 `SwapTotal` 为 0，先启用 swap。测试建议用 zram 或 NVMe swap。
+
+## 2. 运行
 
 ```bash
-cd /path/to/etmem-swap-demo
+cd /path/to/etmemDemo/etmem-swap-demo
 sudo ./run_etmem_swap_demo.sh
 ```
 
-For a stronger signal:
+更强信号：
 
 ```bash
 sudo TOTAL_MB=4096 HOT_MB=128 DURATION_SEC=180 ./run_etmem_swap_demo.sh
 ```
 
-Optional refault check:
+可选 refault 验证：
 
 ```bash
 sudo REFAULT_AFTER=1 ./run_etmem_swap_demo.sh
 ```
 
-`REFAULT_AFTER=1` sends `SIGUSR1` to the target process after etmem stops, causing it to touch all memory again. RSS should rise again as swapped pages fault back in.
+`REFAULT_AFTER=1` 会在 etmem 停止后给靶进程发 `SIGUSR1`，让它重新触碰全部内存。此时 RSS 应该回升，用来证明被换出的页可以正常 fault back。
 
-## Main Tunables
+## 3. 脚本做了什么
 
-- `TOTAL_MB`: total anonymous memory allocated by the target, default `1024`
-- `HOT_MB`: memory continuously touched by the target, default `64`
-- `DURATION_SEC`: etmem running time, default `120`
-- `ETMEM_T`: etmem cold-page threshold, default `1`
-- `ETMEM_INTERVAL`: scan interval in seconds, default `5`
-- `ETMEM_SLEEP`: sleep time between etmem scan/swap rounds, default `10`
-- `ETMEM_SWAP_THRESHOLD`: process memory threshold, default `0g`
+`run_etmem_swap_demo.sh` 会：
 
-## Pass Criteria
+1. 创建 `/tmp/etmem-swap-demo.*` 工作目录。
+2. 启动 `coldmem_target.py`，默认分配 1024 MB 匿名内存。
+3. 等待靶进程触碰全部页面并进入稳定热循环。
+4. 生成 etmem `slide` 配置文件。
+5. 启动 `etmemd`。
+6. 执行 `etmem obj add` 和 `etmem project start`。
+7. 周期采样目标进程的 `VmRSS`、`VmSwap`、系统 `MemAvailable`、`SwapFree` 和 major fault。
+8. 停止 etmem project，输出 PASS/FAIL。
 
-The script prints `PASS` when:
+工作目录中会保留：
 
-- RSS drop is at least `HOT_MB`
-- VmSwap growth is at least `HOT_MB`
+- `metrics.csv`
+- `etmem-slide.conf`
+- `etmem.log`
+- `etmemd.log`
+- `coldmem_target.log`
 
-For a real report, prefer a stronger threshold such as:
+## 4. 主要参数
 
-- RSS drops by at least 30% of `TOTAL_MB - HOT_MB`
-- VmSwap grows by roughly the same order
-- no large sustained major-fault growth during the hot loop
+```bash
+TOTAL_MB=1024              # 靶进程总匿名内存
+HOT_MB=64                  # 持续触碰的热内存
+DURATION_SEC=120           # etmem 运行时长
+SAMPLE_INTERVAL_SEC=5      # 采样间隔
+ETMEM_LOOP=3               # slide 每轮扫描次数
+ETMEM_INTERVAL=5           # slide 扫描间隔
+ETMEM_SLEEP=10             # slide 轮次间 sleep
+ETMEM_T=1                  # 冷页阈值
+ETMEM_MAX_THREADS=1        # etmem task 线程数
+ETMEM_SWAP_THRESHOLD=0g    # 进程阈值，demo 设为容易触发
+REFAULT_AFTER=0            # 是否做回读验证
+```
 
-## Expected Output Shape
+示例：
+
+```bash
+sudo TOTAL_MB=2048 HOT_MB=128 ETMEM_T=1 DURATION_SEC=180 ./run_etmem_swap_demo.sh
+```
+
+## 5. 通过标准
+
+脚本内置的基础通过标准：
+
+- RSS drop 至少达到 `HOT_MB`
+- `VmSwap` growth 至少达到 `HOT_MB`
+
+更适合写报告的标准：
+
+- RSS 下降达到 `TOTAL_MB - HOT_MB` 的 30% 以上
+- `VmSwap` 增长和 RSS 下降同量级
+- `MemAvailable` 有可解释回升
+- 热循环期间 major fault 没有持续尖刺
+
+预期输出：
 
 ```text
-before     rss=   1035 MB  vmswap=      0 MB  memavail=  64000 MB  swapfree=   8192 MB
-running    rss=    620 MB  vmswap=    410 MB  memavail=  64410 MB  swapfree=   7782 MB
-running    rss=    160 MB  vmswap=    875 MB  memavail=  64870 MB  swapfree=   7317 MB
-after      rss=    150 MB  vmswap=    885 MB  memavail=  64880 MB  swapfree=   7307 MB
+before     rss=   1035 MB  vmswap=      0 MB  memavail=  64000 MB  swapfree=   8192 MB  majflt=0
+running    rss=    620 MB  vmswap=    410 MB  memavail=  64410 MB  swapfree=   7782 MB  majflt=0
+running    rss=    160 MB  vmswap=    875 MB  memavail=  64870 MB  swapfree=   7317 MB  majflt=0
+after      rss=    150 MB  vmswap=    885 MB  memavail=  64880 MB  swapfree=   7307 MB  majflt=0
 
 PASS: etmem swapped cold anonymous pages and lowered target resident memory.
 ```
 
-## Common Failures
+## 6. 和真实业务的关系
 
-- `/proc/<pid>/idle_pages is missing`: `etmem_scan` is unavailable or kernel lacks etmem support.
-- `/proc/<pid>/swap_pages is missing`: `etmem_swap` is unavailable or kernel lacks etmem support.
-- no `VmSwap` growth: swap is disabled, config parsing failed, threshold is too strict, or the process was still touching most pages.
-- RSS drops but performance is bad: swap backend is slow. Use zram/NVMe and keep hot pages out of swap.
+这个 demo 只证明 etmem 冷页换出链路可用，不证明真实业务安全。
+
+迁移到 OpenClaw / VM 前建议：
+
+1. 先用 `etmem-scan-demo` 观测真实进程或 QEMU PID 的冷热分布。
+2. 在真实流量下连续采样，确认 cold ratio 稳定。
+3. 小规模开启 swap 验证。
+4. 同时观察业务 QPS/FPS、p95/p99、失败率、major fault、`pswpin/pswpout`。
+5. 如果 p99 或 major fault 抖动明显，降低换出强度或只对业务标记的可换出区域做处理。
+
+## 7. 常见问题
+
+`missing command(s): etmem etmemd`：
+
+安装 etmem 包，或从 openEuler etmem 源码编译。
+
+`no swap is enabled`：
+
+开启 zram 或 NVMe swap 后重试。
+
+`/proc/<pid>/idle_pages is missing`：
+
+```bash
+sudo modprobe etmem_scan
+```
+
+`/proc/<pid>/swap_pages is missing`：
+
+```bash
+sudo modprobe etmem_swap
+```
+
+`etmem obj add failed`：
+
+- 看脚本输出的 `etmem.log`
+- 确认配置文件属主是 root，权限是 `600`
+- 确认 `etmemd` 已启动
+- 确认当前 etmem 版本支持 `slide` 配置项
+
+没有明显 `VmSwap` 增长：
+
+- 增大 `TOTAL_MB`
+- 延长 `DURATION_SEC`
+- 确认靶进程没有持续触碰全部内存
+- 检查 `ETMEM_T`、`ETMEM_INTERVAL`、`ETMEM_SLEEP`
+- 查看 `etmemd.log`
+
+RSS 降了但系统性能变差：
+
+- swap 后端可能太慢
+- 换出强度过高
+- 真实业务热页被误换出
+- 先回到 scan-only 阶段，确认冷热窗口
 
