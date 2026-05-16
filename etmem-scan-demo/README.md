@@ -1,14 +1,14 @@
 # etmem scan-only demo
 
-这个 demo 只使用 openEuler etmem 的扫描接口：
+这个 demo 是 fallback，不是首选的 etmem 用户态分析流程。它只使用 openEuler etmem 的底层扫描接口：
 
 ```text
 /proc/<pid>/idle_pages
 ```
 
-它不启动 `etmemd`，不创建 etmem project，也不写 `/proc/<pid>/swap_pages`。用途是在动手换出之前，先观察某个进程或实例的冷热内存分布。
+它不启动 `etmemd`，不创建 etmem project，也不写 `/proc/<pid>/swap_pages`。用途是在 cslide 不适用或需要排查内核扫描接口时，直接观察扫描结果。
 
-这里没有 `/etc/etmem` 配置过程是刻意的：scan-only demo 只验证内核扫描接口，不走 etmem 用户态 project 管理。需要 etmem 配置文件的是 `etmem-swap-demo` 这一类会启动 `etmemd` 并执行 project 的场景。
+这里没有 `/etc/etmem` 配置过程是刻意的：scan-only demo 只验证内核扫描接口，不走 etmem 用户态 project 管理。要“用 etmem 分析冷热温”，请优先看 `../etmem-cslide-hotness-demo`；需要 etmem 配置文件的是 cslide hotness demo 和 `etmem-swap-demo` 这一类会启动 `etmemd` 并执行 project 的场景。
 
 ## 1. 前置条件
 
