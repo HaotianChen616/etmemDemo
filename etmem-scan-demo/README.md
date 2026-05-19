@@ -60,8 +60,9 @@ sudo TOTAL_MB=4096 HOT_MB=128 SCAN_INTERVAL_SEC=15 SCAN_SAMPLES=5 ./run_etmem_sc
 
 ```text
 warmup scan: clears accessed bits and establishes the observation window
-sample=1 elapsed=15.2s hot=64.0MB cold=960.0MB other=0.0MB holes=0.0MB cold_ratio=93.8% rss=1036.0MB swap=0.0MB majflt=0
-  #1  cold=   960.0MB hot=    64.0MB ratio= 93.8% range=... perms=rw-p path=[anonymous]
+sample=1 elapsed=15.2s hot=64.0MB cold=960.0MB other=0.0MB holes=0.0MB present=1024.0MB scanned_vma_rss=1036.0MB scan_rss_ratio=98.8% process_rss=1036.0MB process_coverage=98.8% swap=0.0MB majflt=0
+  cold_ratio=93.8% (cold / scanned present pages)
+  #1  cold=   960.0MB hot=    64.0MB present=  1024.0MB smaps_rss=  1036.0MB ratio= 93.8% range=... perms=rw-p path=[anonymous]
 ```
 
 合成 demo 通过标准：
@@ -132,6 +133,9 @@ sudo python3 ./scan_idle_pages.py \
 - `other_mb`
 - `hole_mb`
 - `present_mb`
+- `scanned_vma_rss_mb`
+- `scan_rss_ratio`
+- `process_coverage`
 - `cold_ratio`
 - `rss_mb`
 - `swap_mb`
@@ -147,6 +151,8 @@ sudo python3 ./scan_idle_pages.py \
 - `hot_mb`
 - `cold_mb`
 - `present_mb`
+- `smaps_rss_mb`
+- `scan_rss_ratio`
 - `cold_ratio`
 
 ## 6. 如何解读
@@ -155,6 +161,8 @@ sudo python3 ./scan_idle_pages.py \
 
 - cold ratio 在真实负载下连续几个窗口稳定
 - 冷内存集中在大块匿名 VMA 或明确可接受的缓存区域
+- `scan_rss_ratio` 接近 100%，说明 etmem_scan 统计和同一批 VMA 的 `smaps` RSS 口径接近
+- `process_coverage` 足够高，说明当前筛选参数覆盖了进程主要 RSS
 - major fault 没有持续增长
 - 业务 p95/p99 没有异常波动
 

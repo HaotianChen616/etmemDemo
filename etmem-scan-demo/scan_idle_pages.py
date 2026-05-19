@@ -196,6 +196,24 @@ def parse_maps(pid, vma_filter, min_vma_bytes):
     return vmas
 
 
+def read_smaps_rss_kb(pid):
+    rss_by_range = {}
+    current = None
+    with open(f"/proc/{pid}/smaps", "r", encoding="ascii") as f:
+        for line in f:
+            parts = line.rstrip("\n").split(maxsplit=5)
+            if parts and "-" in parts[0]:
+                try:
+                    start_s, end_s = parts[0].split("-", 1)
+                    current = (int(start_s, 16), int(end_s, 16))
+                except ValueError:
+                    current = None
+                continue
+            if current and line.startswith("Rss:"):
+                rss_by_range[current] = int(line.split()[1])
+    return rss_by_range
+
+
 def is_anonymous_vma(vma):
     if vma.inode == "0" and not vma.path:
         return True
@@ -279,18 +297,22 @@ def scan_vma(fd, vma, read_bytes):
 
 def scan_process(pid, args):
     vmas = parse_maps(pid, args.vma_filter, args.min_vma_kb * 1024)
+    rss_by_range = read_smaps_rss_kb(pid)
     fd = open_idle_pages(pid, args)
     total = Stats()
     rows = []
+    scanned_vma_rss_kb = 0
     try:
         for vma in vmas:
+            vma_rss_kb = rss_by_range.get((vma.start, vma.end), 0)
+            scanned_vma_rss_kb += vma_rss_kb
             stats = scan_vma(fd, vma, args.read_bytes)
             total.merge(stats)
-            if stats.total_reported > 0:
-                rows.append((vma, stats))
+            if stats.total_reported > 0 or vma_rss_kb > 0:
+                rows.append((vma, stats, vma_rss_kb))
     finally:
         os.close(fd)
-    return total, rows
+    return total, rows, scanned_vma_rss_kb
 
 
 def ratio(part, whole):
@@ -299,37 +321,47 @@ def ratio(part, whole):
     return part / whole
 
 
-def print_summary(sample_no, total, pid, elapsed):
+def print_summary(sample_no, total, pid, elapsed, scanned_vma_rss_kb):
     rss_kb = read_status_kb(pid, "VmRSS")
     swap_kb = read_status_kb(pid, "VmSwap")
     majflt = read_major_faults(pid)
+    present_kb = total.present / 1024
     print(
         "sample={sample} elapsed={elapsed:.1f}s "
         "hot={hot:.1f}MB cold={cold:.1f}MB other={other:.1f}MB holes={holes:.1f}MB "
-        "cold_ratio={cold_ratio:.1%} rss={rss:.1f}MB swap={swap:.1f}MB majflt={majflt}".format(
+        "present={present:.1f}MB scanned_vma_rss={scanned_rss:.1f}MB "
+        "scan_rss_ratio={scan_rss_ratio:.1%} process_rss={rss:.1f}MB "
+        "process_coverage={process_coverage:.1%} swap={swap:.1f}MB majflt={majflt}".format(
             sample=sample_no,
             elapsed=elapsed,
             hot=bytes_to_mb(total.hot),
             cold=bytes_to_mb(total.cold),
             other=bytes_to_mb(total.other),
             holes=bytes_to_mb(total.hole),
-            cold_ratio=ratio(total.cold, total.present),
+            present=bytes_to_mb(total.present),
+            scanned_rss=scanned_vma_rss_kb / 1024,
+            scan_rss_ratio=ratio(present_kb, scanned_vma_rss_kb),
             rss=rss_kb / 1024,
+            process_coverage=ratio(present_kb, rss_kb),
             swap=swap_kb / 1024,
             majflt=majflt,
         )
     )
+    print(f"  cold_ratio={ratio(total.cold, total.present):.1%} (cold / scanned present pages)")
 
 
 def print_top_vmas(rows, top_n):
-    ranked = sorted(rows, key=lambda item: (item[1].cold, item[1].present), reverse=True)
-    for idx, (vma, stats) in enumerate(ranked[:top_n], start=1):
+    ranked = sorted(rows, key=lambda item: (item[1].cold, item[1].present, item[2]), reverse=True)
+    for idx, (vma, stats, rss_kb) in enumerate(ranked[:top_n], start=1):
         print(
-            "  #{idx:<2} cold={cold:8.1f}MB hot={hot:8.1f}MB ratio={ratio:6.1%} "
+            "  #{idx:<2} cold={cold:8.1f}MB hot={hot:8.1f}MB present={present:8.1f}MB "
+            "smaps_rss={rss:8.1f}MB ratio={ratio:6.1%} "
             "range={start:x}-{end:x} perms={perms} path={path}".format(
                 idx=idx,
                 cold=bytes_to_mb(stats.cold),
                 hot=bytes_to_mb(stats.hot),
+                present=bytes_to_mb(stats.present),
+                rss=rss_kb / 1024,
                 ratio=ratio(stats.cold, stats.present),
                 start=vma.start,
                 end=vma.end,
@@ -348,9 +380,11 @@ def csv_writer(path, fieldnames):
     return f, writer
 
 
-def write_summary_row(writer, sample_no, total, pid, elapsed):
+def write_summary_row(writer, sample_no, total, pid, elapsed, scanned_vma_rss_kb):
     if writer is None:
         return
+    rss_kb = read_status_kb(pid, "VmRSS")
+    present_kb = total.present / 1024
     writer.writerow(
         {
             "sample": sample_no,
@@ -360,8 +394,11 @@ def write_summary_row(writer, sample_no, total, pid, elapsed):
             "other_mb": f"{bytes_to_mb(total.other):.3f}",
             "hole_mb": f"{bytes_to_mb(total.hole):.3f}",
             "present_mb": f"{bytes_to_mb(total.present):.3f}",
+            "scanned_vma_rss_mb": f"{scanned_vma_rss_kb / 1024:.3f}",
+            "scan_rss_ratio": f"{ratio(present_kb, scanned_vma_rss_kb):.6f}",
+            "process_coverage": f"{ratio(present_kb, rss_kb):.6f}",
             "cold_ratio": f"{ratio(total.cold, total.present):.6f}",
-            "rss_mb": f"{read_status_kb(pid, 'VmRSS') / 1024:.3f}",
+            "rss_mb": f"{rss_kb / 1024:.3f}",
             "swap_mb": f"{read_status_kb(pid, 'VmSwap') / 1024:.3f}",
             "major_faults": read_major_faults(pid),
         }
@@ -371,7 +408,7 @@ def write_summary_row(writer, sample_no, total, pid, elapsed):
 def write_vma_rows(writer, sample_no, rows):
     if writer is None:
         return
-    for vma, stats in rows:
+    for vma, stats, rss_kb in rows:
         writer.writerow(
             {
                 "sample": sample_no,
@@ -384,6 +421,8 @@ def write_vma_rows(writer, sample_no, rows):
                 "other_mb": f"{bytes_to_mb(stats.other):.3f}",
                 "hole_mb": f"{bytes_to_mb(stats.hole):.3f}",
                 "present_mb": f"{bytes_to_mb(stats.present):.3f}",
+                "smaps_rss_mb": f"{rss_kb / 1024:.3f}",
+                "scan_rss_ratio": f"{ratio(stats.present / 1024, rss_kb):.6f}",
                 "cold_ratio": f"{ratio(stats.cold, stats.present):.6f}",
             }
         )
@@ -417,6 +456,9 @@ def main():
             "other_mb",
             "hole_mb",
             "present_mb",
+            "scanned_vma_rss_mb",
+            "scan_rss_ratio",
+            "process_coverage",
             "cold_ratio",
             "rss_mb",
             "swap_mb",
@@ -436,6 +478,8 @@ def main():
             "other_mb",
             "hole_mb",
             "present_mb",
+            "smaps_rss_mb",
+            "scan_rss_ratio",
             "cold_ratio",
         ),
     )
@@ -449,11 +493,11 @@ def main():
 
         for sample_no in range(1, args.samples + 1):
             ensure_alive(args.pid)
-            total, rows = scan_process(args.pid, args)
+            total, rows, scanned_vma_rss_kb = scan_process(args.pid, args)
             elapsed = time.time() - start_time
-            print_summary(sample_no, total, args.pid, elapsed)
+            print_summary(sample_no, total, args.pid, elapsed, scanned_vma_rss_kb)
             print_top_vmas(rows, args.top)
-            write_summary_row(summary_writer, sample_no, total, args.pid, elapsed)
+            write_summary_row(summary_writer, sample_no, total, args.pid, elapsed, scanned_vma_rss_kb)
             write_vma_rows(vma_writer, sample_no, rows)
             if sample_no != args.samples:
                 time.sleep(args.interval)
