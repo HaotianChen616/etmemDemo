@@ -75,12 +75,15 @@ sudo REFAULT_AFTER=1 ./run_etmem_swap_demo.sh
 5. 启动 `etmemd`。
 6. 执行 `etmem obj add` 和 `etmem project start`。
 7. 周期采样目标进程的 `VmRSS`、`VmSwap`、系统 `MemAvailable`、`SwapFree` 和 major fault。
-8. 停止 etmem project，输出 PASS/FAIL。
+8. 默认在每次采样前额外展示一次 scan snapshot，包括 hot/cold/present/coverage/top VMA。
+9. 停止 etmem project，输出 PASS/FAIL。
 
 工作目录中会保留：
 
 - `metrics.csv`
-- `etmem-slide.conf`
+- `scan.log`
+- `scan/*.csv`
+- `etmem-demo-slide-<script_pid>.conf`
 - `etmem.log`
 - `etmemd.log`
 - `coldmem_target.log`
@@ -132,6 +135,9 @@ TOTAL_MB=1024              # 靶进程总匿名内存
 HOT_MB=64                  # 持续触碰的热内存
 DURATION_SEC=120           # etmem 运行时长
 SAMPLE_INTERVAL_SEC=5      # 采样间隔
+SHOW_SCAN=1                # 每次采样展示一次 scan snapshot；设为 0 可关闭
+SCAN_TOP=5                 # scan snapshot 展示最冷的前 N 个 VMA
+SCAN_PRIME_SEC=5           # before 采样前先清 accessed bit 并等待的秒数
 ETMEM_LOOP=3               # slide 每轮扫描次数
 ETMEM_INTERVAL=5           # slide 扫描间隔
 ETMEM_SLEEP=10             # slide 轮次间 sleep
@@ -146,6 +152,12 @@ CONFIG_DIR=/tmp/...        # etmem 配置目录；可设为 /etc/etmem
 
 ```bash
 sudo TOTAL_MB=2048 HOT_MB=128 ETMEM_T=1 DURATION_SEC=180 ./run_etmem_swap_demo.sh
+```
+
+如果只想看 etmem 换出结果，不想让额外 scan snapshot 干扰 etmem 的 accessed-bit 统计：
+
+```bash
+sudo SHOW_SCAN=0 ./run_etmem_swap_demo.sh
 ```
 
 ## 5. 通过标准
@@ -165,13 +177,27 @@ sudo TOTAL_MB=2048 HOT_MB=128 ETMEM_T=1 DURATION_SEC=180 ./run_etmem_swap_demo.s
 预期输出：
 
 ```text
+priming scan window: clear accessed bits, then wait 5s
+
+scan snapshot before 'before' sample:
+sample=1 elapsed=0.1s hot=64.0MB cold=960.0MB other=0.0MB holes=0.0MB present=1024.0MB scanned_vma_rss=1035.0MB scan_rss_ratio=98.9% process_rss=1035.0MB process_coverage=98.9% swap=0.0MB majflt=0
+  cold_ratio=93.8% (cold / scanned present pages)
 before     rss=   1035 MB  vmswap=      0 MB  memavail=  64000 MB  swapfree=   8192 MB  majflt=0
-running    rss=    620 MB  vmswap=    410 MB  memavail=  64410 MB  swapfree=   7782 MB  majflt=0
-running    rss=    160 MB  vmswap=    875 MB  memavail=  64870 MB  swapfree=   7317 MB  majflt=0
-after      rss=    150 MB  vmswap=    885 MB  memavail=  64880 MB  swapfree=   7307 MB  majflt=0
+
+scan snapshot before 'running' sample:
+sample=1 elapsed=0.1s hot=64.0MB cold=640.0MB other=0.0MB holes=320.0MB present=704.0MB scanned_vma_rss=715.0MB scan_rss_ratio=98.5% process_rss=715.0MB process_coverage=98.5% swap=320.0MB majflt=0
+  cold_ratio=90.9% (cold / scanned present pages)
+running    rss=    715 MB  vmswap=    320 MB  memavail=  64320 MB  swapfree=   7872 MB  majflt=0
+
+scan snapshot before 'after' sample:
+sample=1 elapsed=0.1s hot=64.0MB cold=80.0MB other=0.0MB holes=880.0MB present=144.0MB scanned_vma_rss=151.0MB scan_rss_ratio=95.4% process_rss=151.0MB process_coverage=95.4% swap=884.0MB majflt=0
+  cold_ratio=55.6% (cold / scanned present pages)
+after      rss=    151 MB  vmswap=    884 MB  memavail=  64880 MB  swapfree=   7308 MB  majflt=0
 
 PASS: etmem swapped cold anonymous pages and lowered target resident memory.
 ```
+
+注意：scan snapshot 通过读取 `/proc/<pid>/idle_pages` 展示当前窗口冷热分布，这个读取动作会清 accessed bit。它适合 demo 解释过程；做纯 etmem 效果测量时建议设置 `SHOW_SCAN=0`。
 
 ## 6. 和真实业务的关系
 

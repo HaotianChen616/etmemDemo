@@ -7,6 +7,9 @@ TOTAL_MB="${TOTAL_MB:-1024}"
 HOT_MB="${HOT_MB:-64}"
 DURATION_SEC="${DURATION_SEC:-120}"
 SAMPLE_INTERVAL_SEC="${SAMPLE_INTERVAL_SEC:-5}"
+SHOW_SCAN="${SHOW_SCAN:-1}"
+SCAN_TOP="${SCAN_TOP:-5}"
+SCAN_PRIME_SEC="${SCAN_PRIME_SEC:-5}"
 ETMEM_LOOP="${ETMEM_LOOP:-3}"
 ETMEM_INTERVAL="${ETMEM_INTERVAL:-5}"
 ETMEM_SLEEP="${ETMEM_SLEEP:-10}"
@@ -26,6 +29,8 @@ READY_FILE="$WORKDIR/ready"
 PID_FILE="$WORKDIR/target.pid"
 CONFIG_FILE="$CONFIG_DIR/etmem-demo-slide-$$.conf"
 METRICS_FILE="$WORKDIR/metrics.csv"
+SCAN_DIR="$WORKDIR/scan"
+SCAN_LOG="$WORKDIR/scan.log"
 TARGET_LOG="$WORKDIR/coldmem_target.log"
 ETMEMD_LOG="$WORKDIR/etmemd.log"
 ETMEM_LOG="$WORKDIR/etmem.log"
@@ -105,6 +110,26 @@ sample_once() {
   local phase="$1"
   local ts rss_kb swap_kb memavail_kb swapfree_kb majflt
   ts="$(date +%s)"
+
+  if [[ "$SHOW_SCAN" == "1" ]]; then
+    mkdir -p "$SCAN_DIR"
+    local scan_summary_file="$SCAN_DIR/${phase}-${ts}-summary.csv"
+    local scan_vma_file="$SCAN_DIR/${phase}-${ts}-vmas.csv"
+    echo
+    echo "scan snapshot before '$phase' sample:"
+    python3 "$SCRIPT_DIR/../etmem-scan-demo/scan_idle_pages.py" \
+      --pid "$TARGET_PID" \
+      --samples 1 \
+      --top "$SCAN_TOP" \
+      --vma-filter anon \
+      --min-vma-kb 0 \
+      --csv "$scan_summary_file" \
+      --vma-csv "$scan_vma_file" \
+      2>&1 | tee -a "$SCAN_LOG"
+    echo "  scan csv: $scan_summary_file"
+    echo "  vma csv : $scan_vma_file"
+  fi
+
   rss_kb="$(status_value_kb "$TARGET_PID" VmRSS)"
   swap_kb="$(status_value_kb "$TARGET_PID" VmSwap)"
   memavail_kb="$(meminfo_value_kb MemAvailable)"
@@ -115,6 +140,23 @@ sample_once() {
   printf "%-10s rss=%7d MB  vmswap=%7d MB  memavail=%7d MB  swapfree=%7d MB  majflt=%s\n" \
     "$phase" "$((rss_kb / 1024))" "$((swap_kb / 1024))" "$((memavail_kb / 1024))" \
     "$((swapfree_kb / 1024))" "$majflt"
+}
+
+prime_scan_window() {
+  if [[ "$SHOW_SCAN" != "1" ]]; then
+    return
+  fi
+
+  echo
+  echo "priming scan window: clear accessed bits, then wait ${SCAN_PRIME_SEC}s"
+  python3 "$SCRIPT_DIR/../etmem-scan-demo/scan_idle_pages.py" \
+    --pid "$TARGET_PID" \
+    --samples 1 \
+    --top 0 \
+    --vma-filter anon \
+    --min-vma-kb 0 \
+    >>"$SCAN_LOG" 2>&1 || true
+  sleep "$SCAN_PRIME_SEC"
 }
 
 wait_for_ready() {
@@ -218,6 +260,8 @@ summarize() {
   echo "  target VmSwap growth: ${swap_inc_mb} MB"
   echo "  MemAvailable change : ${memavail_inc_mb} MB"
   echo "  metrics             : $METRICS_FILE"
+  echo "  scan csv directory  : $SCAN_DIR"
+  echo "  scan log            : $SCAN_LOG"
   echo "  etmem config         : $CONFIG_FILE"
   echo "  etmem log            : $ETMEM_LOG"
   echo "  etmemd log           : $ETMEMD_LOG"
@@ -238,12 +282,13 @@ main() {
   try_load_modules
 
   echo "workdir: $WORKDIR"
-  echo "config: TOTAL_MB=$TOTAL_MB HOT_MB=$HOT_MB DURATION_SEC=$DURATION_SEC ETMEM_T=$ETMEM_T"
+  echo "config: TOTAL_MB=$TOTAL_MB HOT_MB=$HOT_MB DURATION_SEC=$DURATION_SEC ETMEM_T=$ETMEM_T SHOW_SCAN=$SHOW_SCAN"
   echo "timestamp,phase,rss_kb,vmswap_kb,memavailable_kb,swapfree_kb,major_faults" >"$METRICS_FILE"
 
   start_target
   write_config
   show_config
+  prime_scan_window
   sample_once "before"
 
   start_etmem
