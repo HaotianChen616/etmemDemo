@@ -107,7 +107,52 @@ sudo python3 ./scan_idle_pages.py \
   --vma-csv /tmp/qemu-scan-vmas.csv
 ```
 
-## 4. 关键语义
+## 4. 持续监控
+
+持续监控用 `--watch`：
+
+```bash
+sudo python3 ./scan_idle_pages.py \
+  --pid <PID> \
+  --warmup \
+  --interval 30 \
+  --watch \
+  --vma-filter all \
+  --min-vma-kb 0 \
+  --csv /tmp/etmem-scan-summary.csv
+```
+
+或者用 `--samples 0`，含义同样是一直跑到手动停止：
+
+```bash
+sudo python3 ./scan_idle_pages.py \
+  --pid <PID> \
+  --warmup \
+  --interval 30 \
+  --samples 0 \
+  --vma-filter all \
+  --min-vma-kb 0 \
+  --csv /tmp/etmem-scan-summary.csv
+```
+
+限制运行时长可以用 `timeout`：
+
+```bash
+sudo timeout 1h python3 ./scan_idle_pages.py \
+  --pid <PID> \
+  --warmup \
+  --interval 30 \
+  --watch \
+  --vma-filter all \
+  --min-vma-kb 0 \
+  --csv /tmp/etmem-scan-summary.csv
+```
+
+长时间监控建议先只写 summary CSV，不写 `--vma-csv`，否则每轮每个 VMA 都会追加一批记录，文件会增长很快。需要定位具体冷 VMA 时，再短时间打开 `--vma-csv`。
+
+注意：每次扫描都会读取 `/proc/<pid>/idle_pages`，这个动作会清 accessed bit。因此持续监控时，每一行样本表示“上一次扫描后到本次扫描前”的冷热窗口。
+
+## 5. 关键语义
 
 读取 `idle_pages` 会报告页面访问状态，并清除 accessed bit。所以：
 
@@ -122,7 +167,7 @@ sudo python3 ./scan_idle_pages.py \
 - `holes`：未映射或 non-present 范围，不计入 cold ratio
 - `other`：当前脚本未归入 hot/cold/hole 的状态
 
-## 5. 输出文件
+## 6. 输出文件
 
 `--csv` summary 字段：
 
@@ -155,7 +200,7 @@ sudo python3 ./scan_idle_pages.py \
 - `scan_rss_ratio`
 - `cold_ratio`
 
-## 6. 如何解读
+## 7. 如何解读
 
 适合进入 swap 验证的信号：
 
@@ -173,7 +218,7 @@ sudo python3 ./scan_idle_pages.py \
 - 冷页疑似包含模型权重、KV cache 或推理热路径
 - 扫描目标是 QEMU，但无法确认 guest 内部业务访问模式
 
-## 7. 常见问题
+## 8. 常见问题
 
 `/proc/<pid>/idle_pages does not exist`：
 

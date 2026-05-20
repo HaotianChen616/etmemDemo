@@ -122,7 +122,13 @@ def parse_args():
     )
     parser.add_argument("--pid", type=int, required=True, help="target process PID")
     parser.add_argument("--interval", type=float, default=10.0, help="seconds between samples")
-    parser.add_argument("--samples", type=int, default=3, help="number of reported samples")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=3,
+        help="number of reported samples; use 0 to run forever",
+    )
+    parser.add_argument("--watch", action="store_true", help="run forever until interrupted")
     parser.add_argument("--warmup", action="store_true", help="discard one scan before sampling")
     parser.add_argument("--top", type=int, default=10, help="number of coldest VMAs to print")
     parser.add_argument(
@@ -491,7 +497,8 @@ def main():
             scan_process(args.pid, args)
             time.sleep(args.interval)
 
-        for sample_no in range(1, args.samples + 1):
+        sample_no = 1
+        while args.watch or args.samples == 0 or sample_no <= args.samples:
             ensure_alive(args.pid)
             total, rows, scanned_vma_rss_kb = scan_process(args.pid, args)
             elapsed = time.time() - start_time
@@ -499,8 +506,15 @@ def main():
             print_top_vmas(rows, args.top)
             write_summary_row(summary_writer, sample_no, total, args.pid, elapsed, scanned_vma_rss_kb)
             write_vma_rows(vma_writer, sample_no, rows)
-            if sample_no != args.samples:
+            if summary_f:
+                summary_f.flush()
+            if vma_f:
+                vma_f.flush()
+            sample_no += 1
+            if args.watch or args.samples == 0 or sample_no <= args.samples:
                 time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\ninterrupted; exiting monitor")
     finally:
         if summary_f:
             summary_f.close()
