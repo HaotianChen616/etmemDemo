@@ -119,6 +119,7 @@ sample_once() {
     echo "scan snapshot before '$phase' sample:"
     python3 "$SCRIPT_DIR/../etmem-scan-demo/scan_idle_pages.py" \
       --pid "$TARGET_PID" \
+      --interval 0 \
       --samples 1 \
       --top "$SCAN_TOP" \
       --vma-filter anon \
@@ -151,6 +152,7 @@ prime_scan_window() {
   echo "priming scan window: clear accessed bits, then wait ${SCAN_PRIME_SEC}s"
   python3 "$SCRIPT_DIR/../etmem-scan-demo/scan_idle_pages.py" \
     --pid "$TARGET_PID" \
+    --interval 0 \
     --samples 1 \
     --top 0 \
     --vma-filter anon \

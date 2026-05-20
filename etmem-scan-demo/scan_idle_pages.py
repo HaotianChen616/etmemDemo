@@ -121,7 +121,9 @@ def parse_args():
         description="Scan /proc/<pid>/idle_pages and report hot/cold memory distribution."
     )
     parser.add_argument("--pid", type=int, required=True, help="target process PID")
-    parser.add_argument("--interval", type=float, default=10.0, help="seconds between samples")
+    parser.add_argument("--interval", type=float, default=10.0, help="seconds between scan rounds")
+    parser.add_argument("--loop", type=int, default=1, help="scan rounds per reported sample")
+    parser.add_argument("--t", type=int, default=1, help="cold threshold: access_count < T is cold")
     parser.add_argument(
         "--samples",
         type=int,
@@ -279,6 +281,38 @@ def parse_idle_stream(data, initial_addr, clip_start, clip_end):
     return stats
 
 
+def parse_idle_stream_intervals(data, initial_addr, clip_start, clip_end):
+    intervals = []
+    cursor = initial_addr
+    i = 0
+    while i < len(data):
+        byte = data[i]
+        page_type = byte >> 4
+        page_count = byte & 0x0F
+        if page_type == PIP_CMD:
+            if byte == PIP_CMD_SET_HVA and i + 8 < len(data):
+                cursor = int.from_bytes(data[i + 1 : i + 9], byteorder="big")
+                i += 9
+                continue
+            i += 1
+            continue
+
+        page_size = TYPE_SIZE.get(page_type)
+        if page_size is None:
+            i += 1
+            continue
+
+        run_start = cursor
+        run_end = cursor + page_count * page_size
+        clipped_start = max(run_start, clip_start)
+        clipped_end = min(run_end, clip_end)
+        if clipped_end > clipped_start:
+            intervals.append((clipped_start, clipped_end, page_type))
+        cursor = run_end
+        i += 1
+    return intervals
+
+
 def scan_vma(fd, vma, read_bytes):
     stats = Stats()
     pos = vma.start
@@ -301,6 +335,28 @@ def scan_vma(fd, vma, read_bytes):
     return stats
 
 
+def scan_vma_intervals(fd, vma, read_bytes):
+    intervals = []
+    pos = vma.start
+    while pos < vma.end:
+        read_count = scan_byte_count_for_range(pos, vma.end, read_bytes)
+        os.lseek(fd, pos, os.SEEK_SET)
+        try:
+            data = os.read(fd, read_count)
+        except OSError as exc:
+            if exc.errno in (errno.EINVAL, errno.EFAULT):
+                break
+            raise
+        if not data:
+            break
+        intervals.extend(parse_idle_stream_intervals(data, pos, vma.start, vma.end))
+        new_pos = os.lseek(fd, 0, os.SEEK_CUR)
+        if new_pos <= pos:
+            break
+        pos = new_pos
+    return intervals
+
+
 def scan_process(pid, args):
     vmas = parse_maps(pid, args.vma_filter, args.min_vma_kb * 1024)
     rss_by_range = read_smaps_rss_kb(pid)
@@ -318,6 +374,75 @@ def scan_process(pid, args):
                 rows.append((vma, stats, vma_rss_kb))
     finally:
         os.close(fd)
+    return total, rows, scanned_vma_rss_kb
+
+
+def page_indices(start, end):
+    first = start // PAGE_SIZE
+    last = (end + PAGE_SIZE - 1) // PAGE_SIZE
+    return range(first, last)
+
+
+@dataclass
+class VMAWindow:
+    access_counts: dict = field(default_factory=dict)
+    classifiable_pages: set = field(default_factory=set)
+    other_pages: set = field(default_factory=set)
+    last_hole_pages: set = field(default_factory=set)
+
+    def update(self, intervals):
+        current_holes = set()
+        for start, end, page_type in intervals:
+            pages = page_indices(start, end)
+            if page_type in HOT_TYPES:
+                for page in pages:
+                    self.classifiable_pages.add(page)
+                    self.access_counts[page] = self.access_counts.get(page, 0) + 1
+            elif page_type in COLD_TYPES:
+                self.classifiable_pages.update(pages)
+            elif page_type in HOLE_TYPES:
+                current_holes.update(pages)
+            else:
+                self.other_pages.update(pages)
+        self.last_hole_pages = current_holes
+
+    def stats(self, threshold):
+        stats = Stats()
+        for page in self.classifiable_pages:
+            if self.access_counts.get(page, 0) >= threshold:
+                stats.hot += PAGE_SIZE
+            else:
+                stats.cold += PAGE_SIZE
+        stats.other = len(self.other_pages - self.classifiable_pages) * PAGE_SIZE
+        stats.hole = len(self.last_hole_pages) * PAGE_SIZE
+        return stats
+
+
+def scan_process_window(pid, args):
+    vmas = parse_maps(pid, args.vma_filter, args.min_vma_kb * 1024)
+    rss_by_range = read_smaps_rss_kb(pid)
+    windows = {idx: VMAWindow() for idx in range(len(vmas))}
+
+    for scan_idx in range(args.loop):
+        time.sleep(args.interval)
+        fd = open_idle_pages(pid, args)
+        try:
+            for idx, vma in enumerate(vmas):
+                intervals = scan_vma_intervals(fd, vma, args.read_bytes)
+                windows[idx].update(intervals)
+        finally:
+            os.close(fd)
+
+    total = Stats()
+    rows = []
+    scanned_vma_rss_kb = 0
+    for idx, vma in enumerate(vmas):
+        vma_rss_kb = rss_by_range.get((vma.start, vma.end), 0)
+        scanned_vma_rss_kb += vma_rss_kb
+        stats = windows[idx].stats(args.t)
+        total.merge(stats)
+        if stats.total_reported > 0 or vma_rss_kb > 0:
+            rows.append((vma, stats, vma_rss_kb))
     return total, rows, scanned_vma_rss_kb
 
 
@@ -445,12 +570,19 @@ def ensure_alive(pid):
 
 def main():
     args = parse_args()
+    if args.loop < 1:
+        raise SystemExit("--loop must be >= 1")
+    if args.t < 1:
+        raise SystemExit("--t must be >= 1")
+    if args.t > args.loop:
+        raise SystemExit("--t must be <= --loop; otherwise every classifiable page is cold")
     if os.geteuid() != 0:
         raise SystemExit("run as root; /proc/<pid>/idle_pages requires elevated privileges")
     ensure_alive(args.pid)
     idle_path = f"/proc/{args.pid}/idle_pages"
     if not os.path.exists(idle_path):
         raise SystemExit(f"{idle_path} does not exist; load etmem_scan or use an etmem-capable kernel")
+    print(f"scan config: loop={args.loop} interval={args.interval}s T={args.t}")
 
     summary_f, summary_writer = csv_writer(
         args.csv,
@@ -495,12 +627,11 @@ def main():
         if args.warmup:
             print("warmup scan: clears accessed bits and establishes the observation window")
             scan_process(args.pid, args)
-            time.sleep(args.interval)
 
         sample_no = 1
         while args.watch or args.samples == 0 or sample_no <= args.samples:
             ensure_alive(args.pid)
-            total, rows, scanned_vma_rss_kb = scan_process(args.pid, args)
+            total, rows, scanned_vma_rss_kb = scan_process_window(args.pid, args)
             elapsed = time.time() - start_time
             print_summary(sample_no, total, args.pid, elapsed, scanned_vma_rss_kb)
             print_top_vmas(rows, args.top)

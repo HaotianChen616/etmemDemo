@@ -172,6 +172,23 @@ sudo ./run_etmem_scan_demo.sh
 sudo TOTAL_MB=4096 HOT_MB=128 SCAN_INTERVAL_SEC=15 SCAN_SAMPLES=5 ./run_etmem_scan_demo.sh
 ```
 
+如果想用类似 etmem `loop/interval/T` 的方式看随时间变化的冷热占比，可以直接跑：
+
+```bash
+sudo python3 ./scan_idle_pages.py \
+  --pid <PID> \
+  --warmup \
+  --loop 3 \
+  --interval 10 \
+  --t 2 \
+  --watch \
+  --vma-filter all \
+  --min-vma-kb 0 \
+  --csv /tmp/etmem-scan-summary.csv
+```
+
+这表示每个样本内部扫描 3 轮，每轮间隔 10 秒；访问次数 `< 2` 判为 cold，`>= 2` 判为 hot。
+
 预期现象：
 
 - 输出中 `hot` 接近 `HOT_MB`

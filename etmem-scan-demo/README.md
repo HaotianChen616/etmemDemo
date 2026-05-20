@@ -88,10 +88,29 @@ sudo python3 ./scan_idle_pages.py \
 参数建议：
 
 - `--samples`：输出多少次扫描结果，不是内存页数量。
+- `--loop`：每个样本内部扫描几轮，默认 `1`。
+- `--t`：冷热阈值，访问次数 `< T` 判为 cold，访问次数 `>= T` 判为 hot，默认 `1`。
+- `--interval`：每轮扫描之间等待多少秒。`--loop 3 --interval 10` 表示一个样本覆盖约 30 秒。
 - 普通应用进程：先用 `--vma-filter anon`
 - QEMU / VM 进程：先用 `--vma-filter rw-private --min-vma-kb 2048`
 - 想看全部可读映射：使用 `--vma-filter all`
 - 观察窗口太短时容易把偶发访问误判为热，建议从 `--interval 30` 起步
+
+模拟 etmem `loop=3 interval=10 T=2`：
+
+```bash
+sudo python3 ./scan_idle_pages.py \
+  --pid <PID> \
+  --warmup \
+  --loop 3 \
+  --interval 10 \
+  --t 2 \
+  --samples 5 \
+  --vma-filter all \
+  --min-vma-kb 0
+```
+
+这个模式仍然不经过 `etmemd`，但冷热判定语义和 etmem `T` 接近：每个样本扫 3 轮，某页在 3 轮中被访问少于 2 次就归为 cold。
 
 QEMU 示例：
 
@@ -152,13 +171,16 @@ sudo timeout 1h python3 ./scan_idle_pages.py \
 
 注意：每次扫描都会读取 `/proc/<pid>/idle_pages`，这个动作会清 accessed bit。因此持续监控时，每一行样本表示“上一次扫描后到本次扫描前”的冷热窗口。
 
+如果设置了 `--loop 3 --interval 10 --t 2`，持续监控时每一行样本表示约 30 秒窗口内的访问次数分类。
+
 ## 5. 关键语义
 
 读取 `idle_pages` 会报告页面访问状态，并清除 accessed bit。所以：
 
 - 第一次扫描通常用来建立基线。
 - `--warmup` 会丢弃第一次扫描结果。
-- 后续样本表示“上一次扫描后到本次扫描前”这个窗口内的冷热状态。
+- 默认 `--loop 1 --t 1` 时，后续样本表示“上一次扫描后到本次扫描前”这个窗口内的冷热状态。
+- `--loop N --t T` 时，一个样本会扫描 N 轮，累计每页被访问过的轮数；访问次数 `< T` 算 cold，`>= T` 算 hot。
 
 本工具中的分类：
 
