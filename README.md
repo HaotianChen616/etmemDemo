@@ -8,6 +8,7 @@
 仓库包含两个 demo：
 
 - `etmem-cslide-hotness-demo`：真正走 `etmemd + cslide + etmem engine showtaskpages/showhostpages`，用于用 etmem 分析 VM/QEMU 实例的冷热温。
+- `etmem-slide-monitor`：没有 AEP/SCM 时使用 `slide`，自动生成 etmem 配置、启动 etmemd、监控目标 PID 的 RSS/Swap，并可输出冷热占比诊断。
 - `etmem-swap-demo`：启动 `etmemd` 和 `slide` 工程，把合成靶进程的冷匿名页换出，用 `VmRSS` / `VmSwap` / `MemAvailable` 验证效果。
 - `etmem-scan-demo`：底层 fallback，只读 `/proc/<pid>/idle_pages`，不启动 `etmemd`，用于验证 etmem_scan 内核接口。
 
@@ -226,6 +227,31 @@ sudo python3 ./scan_idle_pages.py \
 注意：读取 `idle_pages` 会清 accessed bit。`--warmup` 的作用是先清一次基线，再等待一个观测窗口，后续样本才更接近“这段窗口内谁热、谁冷”。
 
 ## 4. 第三阶段：验证冷页换出
+
+如果你已经有目标 PID，或者想让脚本启动目标进程后自动 attach，使用 slide monitor：
+
+```bash
+cd ../etmem-slide-monitor
+sudo ./run_etmem_slide_monitor.sh \
+  --pid <PID> \
+  --loop 3 \
+  --interval 10 \
+  --t 2 \
+  --sample-interval 30
+```
+
+让脚本启动目标进程：
+
+```bash
+sudo ./run_etmem_slide_monitor.sh \
+  --loop 3 \
+  --interval 10 \
+  --t 2 \
+  --duration 3600 \
+  -- /path/to/your_app --arg1 --arg2
+```
+
+如果只想做合成冷页换出穿刺，再进入 swap demo：
 
 回到仓库根目录或进入 swap demo：
 
