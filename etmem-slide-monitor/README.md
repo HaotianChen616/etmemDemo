@@ -23,8 +23,8 @@
 
 所以本脚本分两层：
 
-1. **真正 etmem slide**：负责按配置里的 `loop/interval/T` 扫描并换出冷页。
-2. **冷热占比诊断**：默认开启，使用 `etmem_scan` 的 `/proc/<pid>/idle_pages` 按同样 `loop/interval/T` 输出 hot/cold 比例。
+1. **真正 etmem slide**：负责按配置里的 `loop/sleep/interval/T` 扫描并换出冷页。
+2. **冷热占比诊断**：默认开启，使用 `etmem_scan` 的 `/proc/<pid>/idle_pages` 按同样 `loop/sleep/interval/T` 输出 hot/cold 比例。
 
 为了避免监控脚本默认改变业务内存，`--swap-threshold` 默认是 `999999g`，基本等价于 monitor-first。要主动换出冷页时显式设置：
 
@@ -45,7 +45,8 @@ cd /path/to/etmemDemo/etmem-slide-monitor
 sudo ./run_etmem_slide_monitor.sh \
   --pid <PID> \
   --loop 3 \
-  --interval 10 \
+  --sleep 10 \
+  --interval 30 \
   --t 2 \
   --sample-interval 30
 ```
@@ -55,12 +56,15 @@ sudo ./run_etmem_slide_monitor.sh \
 ```text
 etmem slide:
   loop=3
-  interval=10
+  sleep=10
+  interval=30
   T=2
 
 冷热诊断:
-  每个样本也用 loop=3 interval=10 T=2 统计 hot/cold
+  每个样本也用 loop=3 sleep=10 interval=30 T=2 统计 hot/cold
 ```
+
+当前 etmem 源码口径是：`loop` 是一次 page scan 任务内部扫几轮；`sleep` 在这个循环里每轮扫描后执行；`interval` 进入 thread timer，用于调度下一次扫描任务。
 
 ## 2. 由脚本启动目标进程
 
@@ -69,7 +73,8 @@ etmem slide:
 ```bash
 sudo ./run_etmem_slide_monitor.sh \
   --loop 3 \
-  --interval 10 \
+  --sleep 10 \
+  --interval 30 \
   --t 2 \
   --duration 3600 \
   -- /path/to/your_app --arg1 --arg2
@@ -92,7 +97,8 @@ sudo ./run_etmem_slide_monitor.sh \
 sudo ./run_etmem_slide_monitor.sh \
   --pid <PID> \
   --loop 3 \
-  --interval 10 \
+  --sleep 10 \
+  --interval 30 \
   --t 2 \
   --show-heat 0
 ```
@@ -108,13 +114,13 @@ VmRSS / VmSwap / MemAvailable / SwapFree / major fault
 ```bash
 --pid PID                 监控已有进程
 --loop N                  etmem project loop，默认 3
---interval SEC            etmem scan interval，默认 10
+--sleep SEC               etmem loop 内每轮扫描后的 sleep，默认 10
+--interval SEC            etmem 下一次 scan job 的 timer interval，默认 30
 --t N                     etmem slide 冷页阈值 T，默认 2
---sleep SEC               etmem project sleep，默认 30
 --duration SEC            运行多久后停止，0 表示直到目标进程退出或 Ctrl+C
 --sample-interval SEC     指标打印间隔，默认 30
 --show-heat 0|1           是否输出冷热占比诊断，默认 1
---heat-vma-filter MODE    anon / rw-private / all，默认 all
+--heat-vma-filter MODE    slide-anon / anon / rw-private / all，默认 slide-anon
 --heat-min-vma-kb KB      冷热诊断跳过小 VMA，默认 0
 --heat-top N              冷热诊断打印最冷前 N 个 VMA，默认 5
 --config-dir DIR          etmem 配置目录，默认 /etc/etmem
@@ -135,8 +141,8 @@ VmRSS / VmSwap / MemAvailable / SwapFree / major fault
 [project]
 name=slide_monitor_12345
 loop=3
-interval=10
-sleep=30
+interval=30
+sleep=10
 sysmem_threshold=100
 swapcache_high_wmark=5
 swapcache_low_wmark=3

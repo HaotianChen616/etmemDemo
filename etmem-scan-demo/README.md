@@ -1,14 +1,14 @@
 # etmem scan-only demo
 
-这个 demo 是 fallback，不是首选的 etmem 用户态分析流程。它只使用 openEuler etmem 的底层扫描接口：
+这个 demo 是 `etmem_scan` 旁路观测器。它不依赖 `etmemd` 的报表接口，而是直接使用 openEuler etmem 的底层扫描接口：
 
 ```text
 /proc/<pid>/idle_pages
 ```
 
-它不启动 `etmemd`，不创建 etmem project，也不写 `/proc/<pid>/swap_pages`。用途是在 cslide 不适用或需要排查内核扫描接口时，直接观察扫描结果。
+它不启动 `etmemd`，不创建 etmem project，也不写 `/proc/<pid>/swap_pages`。它读取的页面状态来自 etmem；脚本自己做的是把这些状态按 `slide` 风格累计成 hot/cold 占比报表。
 
-这里没有 `/etc/etmem` 配置过程是刻意的：scan-only demo 只验证内核扫描接口，不走 etmem 用户态 project 管理。要“用 etmem 分析冷热温”，请优先看 `../etmem-cslide-hotness-demo`；需要 etmem 配置文件的是 cslide hotness demo 和 `etmem-swap-demo` 这一类会启动 `etmemd` 并执行 project 的场景。
+这里没有 `/etc/etmem` 配置过程是刻意的：scan-only demo 走 `etmem_scan` 内核接口，不走 etmem 用户态 project 管理。要看 etmem 官方 engine 自带的热度统计，请优先看 `../etmem-cslide-hotness-demo`；需要 etmem 配置文件的是 cslide hotness demo、`etmem-slide-monitor` 和 `etmem-swap-demo` 这一类会启动 `etmemd` 并执行 project 的场景。
 
 ## 1. 前置条件
 
@@ -80,7 +80,7 @@ sudo python3 ./scan_idle_pages.py \
   --warmup \
   --interval 30 \
   --samples 5 \
-  --vma-filter anon \
+  --vma-filter slide-anon \
   --csv /tmp/etmem-scan-summary.csv \
   --vma-csv /tmp/etmem-scan-vmas.csv
 ```
@@ -88,29 +88,32 @@ sudo python3 ./scan_idle_pages.py \
 参数建议：
 
 - `--samples`：输出多少次扫描结果，不是内存页数量。
-- `--loop`：每个样本内部扫描几轮，默认 `1`。
-- `--t`：冷热阈值，访问次数 `< T` 判为 cold，访问次数 `>= T` 判为 hot，默认 `1`。
-- `--interval`：每轮扫描之间等待多少秒。`--loop 3 --interval 10` 表示一个样本覆盖约 30 秒。
-- 普通应用进程：先用 `--vma-filter anon`
+- `--loop`：每个样本内部扫描几轮，含义对齐 etmem page scan 的 `loop`，默认 `1`。
+- `--sleep`：每轮内部扫描后等待多少秒，含义对齐当前 etmem 源码中 page scan 的 `sleep`；默认 `0` 便于单轮旁路观测。
+- `--interval`：开始下一次输出样本前等待多少秒，含义对齐当前 etmem 源码中调度扫描任务的 `interval`；`--warmup` 后也先等待这个窗口再输出 sample 1。
+- `--t`：冷热阈值，累计访问权重 `< T` 判为 cold，`>= T` 判为 hot，默认 `1`。当前脚本按 etmem slide 权重累计：read/access=`1`，dirty/write=`3`，因此 `T` 可取 `0..loop*3`。
+- 想贴近 slide 默认扫页范围：使用默认 `--vma-filter slide-anon`
+- 普通旁路观测：也可用更窄的 `--vma-filter anon`
 - QEMU / VM 进程：先用 `--vma-filter rw-private --min-vma-kb 2048`
 - 想看全部可读映射：使用 `--vma-filter all`
-- 观察窗口太短时容易把偶发访问误判为热，建议从 `--interval 30` 起步
+- 单轮观察窗口太短时容易把偶发访问误判为热，建议从 `--interval 30` 起步
 
-模拟 etmem `loop=3 interval=10 T=2`：
+按当前源码口径观察一个 etmem slide 配置 `loop=3 sleep=10 interval=30 T=2`：
 
 ```bash
 sudo python3 ./scan_idle_pages.py \
   --pid <PID> \
   --warmup \
   --loop 3 \
-  --interval 10 \
+  --sleep 10 \
+  --interval 30 \
   --t 2 \
   --samples 5 \
-  --vma-filter all \
+  --vma-filter slide-anon \
   --min-vma-kb 0
 ```
 
-这个模式仍然不经过 `etmemd`，但冷热判定语义和 etmem `T` 接近：每个样本扫 3 轮，某页在 3 轮中被访问少于 2 次就归为 cold。
+这个模式仍然不经过 `etmemd`，但热度累计更贴近 slide：每个样本扫 3 轮，read/access 轮次加 `1`，dirty/write 轮次加 `3`，累计权重小于 `2` 就归为 cold。`interval` 是样本任务前的外层窗口；`sleep` 是这 3 轮内部扫描之间的窗口。
 
 QEMU 示例：
 
@@ -136,7 +139,7 @@ sudo python3 ./scan_idle_pages.py \
   --warmup \
   --interval 30 \
   --watch \
-  --vma-filter all \
+  --vma-filter slide-anon \
   --min-vma-kb 0 \
   --csv /tmp/etmem-scan-summary.csv
 ```
@@ -149,7 +152,7 @@ sudo python3 ./scan_idle_pages.py \
   --warmup \
   --interval 30 \
   --samples 0 \
-  --vma-filter all \
+  --vma-filter slide-anon \
   --min-vma-kb 0 \
   --csv /tmp/etmem-scan-summary.csv
 ```
@@ -162,16 +165,16 @@ sudo timeout 1h python3 ./scan_idle_pages.py \
   --warmup \
   --interval 30 \
   --watch \
-  --vma-filter all \
+  --vma-filter slide-anon \
   --min-vma-kb 0 \
   --csv /tmp/etmem-scan-summary.csv
 ```
 
 长时间监控建议先只写 summary CSV，不写 `--vma-csv`，否则每轮每个 VMA 都会追加一批记录，文件会增长很快。需要定位具体冷 VMA 时，再短时间打开 `--vma-csv`。
 
-注意：每次扫描都会读取 `/proc/<pid>/idle_pages`，这个动作会清 accessed bit。因此持续监控时，每一行样本表示“上一次扫描后到本次扫描前”的冷热窗口。
+注意：每次扫描都会读取 `/proc/<pid>/idle_pages`，这个动作会清 accessed bit。因此持续监控时，每一行样本表示本次样本任务各扫描窗口累计出来的冷热结果。
 
-如果设置了 `--loop 3 --interval 10 --t 2`，持续监控时每一行样本表示约 30 秒窗口内的访问次数分类。
+如果设置了 `--loop 3 --sleep 10 --interval 30 --t 2`，warmup 后 sample 1 先观察 30 秒外层窗口，再在同一个样本任务里继续做 3 轮 page scan 累计；后两轮主要反映 `sleep=10` 的内部窗口。
 
 ## 5. 关键语义
 
@@ -179,13 +182,17 @@ sudo timeout 1h python3 ./scan_idle_pages.py \
 
 - 第一次扫描通常用来建立基线。
 - `--warmup` 会丢弃第一次扫描结果。
-- 默认 `--loop 1 --t 1` 时，后续样本表示“上一次扫描后到本次扫描前”这个窗口内的冷热状态。
-- `--loop N --t T` 时，一个样本会扫描 N 轮，累计每页被访问过的轮数；访问次数 `< T` 算 cold，`>= T` 算 hot。
+- 默认 `--loop 1 --t 1` 时，后续样本表示外层 `interval` 窗口内 etmem_scan 看到的冷热状态。
+- `--loop N --t T` 时，一个样本会扫描 N 轮，累计每页的访问权重；read/access 权重为 `1`，dirty/write 权重为 `3`；累计权重 `< T` 算 cold，`>= T` 算 hot。
+- 当前 etmem 源码在每轮 page scan 后执行 `sleep`，包括最后一轮；脚本保留这个等待，因此一个样本的返回时间大致还会包含 `loop * sleep`。
+- 单独运行这个 scan observer 没问题，清 accessed bit 正是它建立下一段观测窗口的方式。
+- 不要让同一个 PID 同时被这个脚本、`etmemd slide` 或另一个 `idle_pages` 读取者并发扫描；先扫描的一方会切走一段访问痕迹，影响后扫描的一方看到的冷热窗口。
+- slide 一次 scan job 的 `loop` 轮扫描完成后才会按累计权重和 `T` 分 hot/cold；完整流程图见根目录 `README.md` 的“slide 何时按 `T` 分冷热”。
 
 本工具中的分类：
 
-- `hot`：etmem_scan 报告为 accessed 或 dirty 的页面
-- `cold`：etmem_scan 报告为 idle 的页面
+- `hot`：按 etmem slide 权重累计后达到 `T` 的页面
+- `cold`：可分类页面中累计权重未达到 `T` 的页面；`T=1` 时通常对应观测窗口里只看到 idle 的页面
 - `holes`：未映射或 non-present 范围，不计入 cold ratio
 - `other`：当前脚本未归入 hot/cold/hole 的状态
 
@@ -257,7 +264,8 @@ sudo modprobe etmem_scan
 扫描结果全是热：
 
 - 目标进程确实持续访问这些页面
-- 观测窗口太短，增大 `--interval`
+- 单轮观测窗口太短，增大 `--interval`
+- 多轮内部窗口太短，增大 `--sleep`
 - 第一次扫描没有丢弃，使用 `--warmup`
 
 扫描结果全是冷：

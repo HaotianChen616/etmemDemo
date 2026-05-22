@@ -6,13 +6,13 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PID=""
 LOOP=3
-INTERVAL=10
+INTERVAL=30
 T=2
-SLEEP_SEC=30
+SLEEP_SEC=10
 DURATION_SEC=0
 SAMPLE_INTERVAL_SEC=30
 SHOW_HEAT=1
-HEAT_VMA_FILTER="all"
+HEAT_VMA_FILTER="slide-anon"
 HEAT_MIN_VMA_KB=0
 HEAT_TOP=5
 CONFIG_DIR="/etc/etmem"
@@ -46,13 +46,13 @@ Usage:
 Options:
   --pid PID                 Attach to an existing process.
   --loop N                  etmem project loop, default 3.
-  --interval SEC            etmem scan interval, default 10.
+  --interval SEC            etmem scan-job timer interval, default 30.
   --t N                     etmem slide cold threshold T, default 2.
-  --sleep SEC               etmem project sleep between cycles, default 30.
+  --sleep SEC               etmem sleep after each inner scan round, default 10.
   --duration SEC            Stop after SEC seconds. 0 means until target exits or Ctrl+C.
   --sample-interval SEC     Metrics print interval, default 30.
   --show-heat 0|1           Print hot/cold diagnostic snapshots, default 1.
-  --heat-vma-filter MODE    anon, rw-private, or all. Default all.
+  --heat-vma-filter MODE    slide-anon, anon, rw-private, or all. Default slide-anon.
   --heat-min-vma-kb KB      Skip smaller VMAs for heat snapshots, default 0.
   --heat-top N              Print top cold VMAs in heat snapshots, default 5.
   --config-dir DIR          Config output dir, default /etc/etmem.
@@ -65,9 +65,9 @@ Options:
   --max-threads N           slide task max_threads, default 1.
 
 Examples:
-  sudo ./run_etmem_slide_monitor.sh --pid 12345 --loop 3 --interval 10 --t 2
+  sudo ./run_etmem_slide_monitor.sh --pid 12345 --loop 3 --sleep 10 --interval 30 --t 2
 
-  sudo ./run_etmem_slide_monitor.sh --loop 3 --interval 10 --t 2 -- \
+  sudo ./run_etmem_slide_monitor.sh --loop 3 --sleep 10 --interval 30 --t 2 -- \
     /path/to/your_app --arg
 
 Note:
@@ -127,8 +127,8 @@ require_commands() {
 require_numbers() {
   [[ "$LOOP" =~ ^[0-9]+$ && "$LOOP" -ge 1 ]] || die "--loop must be >= 1"
   [[ "$INTERVAL" =~ ^[0-9]+$ && "$INTERVAL" -ge 1 ]] || die "--interval must be >= 1"
-  [[ "$T" =~ ^[0-9]+$ && "$T" -ge 1 ]] || die "--t must be >= 1"
-  [[ "$T" -le "$LOOP" ]] || die "--t must be <= --loop"
+  [[ "$T" =~ ^[0-9]+$ ]] || die "--t must be >= 0"
+  [[ "$T" -le "$((LOOP * 3))" ]] || die "--t must be <= --loop * 3"
   [[ "$SLEEP_SEC" =~ ^[0-9]+$ && "$SLEEP_SEC" -ge 1 ]] || die "--sleep must be >= 1"
   [[ "$DURATION_SEC" =~ ^[0-9]+$ ]] || die "--duration must be >= 0"
   [[ "$SAMPLE_INTERVAL_SEC" =~ ^[0-9]+$ && "$SAMPLE_INTERVAL_SEC" -ge 1 ]] || die "--sample-interval must be >= 1"
@@ -224,7 +224,7 @@ print_config() {
   echo
   if [[ "$SHOW_HEAT" == "1" ]]; then
     echo "heat diagnostics: enabled"
-    echo "  The heat ratio is observed via etmem_scan idle_pages using the same loop/interval/T."
+    echo "  The heat ratio is observed via etmem_scan idle_pages using the same loop/sleep/interval/T."
     echo "  This can affect accessed bits. Use --show-heat 0 for slide-only measurement."
   else
     echo "heat diagnostics: disabled"
@@ -288,6 +288,7 @@ sample_heat() {
   python3 "$ROOT_DIR/etmem-scan-demo/scan_idle_pages.py" \
     --pid "$TARGET_PID" \
     --loop "$LOOP" \
+    --sleep "$SLEEP_SEC" \
     --interval "$INTERVAL" \
     --t "$T" \
     --samples 1 \

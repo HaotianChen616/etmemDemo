@@ -10,8 +10,13 @@ from dataclasses import dataclass, field
 
 
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+PAGE_SHIFT = PAGE_SIZE.bit_length() - 1
+PMD_SIZE = 1 << (((PAGE_SHIFT - 3) * (4 - 2)) + 3)
+PUD_SIZE = 1 << (((PAGE_SHIFT - 3) * (4 - 1)) + 3)
 MIN_IDLE_READ_BYTES = 19
 DEFAULT_READ_BYTES = 8192
+READ_WEIGHT = 1
+WRITE_WEIGHT = 3
 
 PTE_ACCESSED = 0
 PMD_ACCESSED = 1
@@ -28,15 +33,15 @@ PIP_CMD_SET_HVA = 0xA0
 
 TYPE_SIZE = {
     PTE_ACCESSED: PAGE_SIZE,
-    PMD_ACCESSED: 2 * 1024 * 1024,
-    PUD_PRESENT: 1024 * 1024 * 1024,
+    PMD_ACCESSED: PMD_SIZE,
+    PUD_PRESENT: PUD_SIZE,
     PTE_DIRTY: PAGE_SIZE,
-    PMD_DIRTY: 2 * 1024 * 1024,
+    PMD_DIRTY: PMD_SIZE,
     PTE_IDLE: PAGE_SIZE,
-    PMD_IDLE: 2 * 1024 * 1024,
-    PMD_IDLE_PTES: 2 * 1024 * 1024,
+    PMD_IDLE: PMD_SIZE,
+    PMD_IDLE_PTES: PMD_SIZE,
     PTE_HOLE: PAGE_SIZE,
-    PMD_HOLE: 2 * 1024 * 1024,
+    PMD_HOLE: PMD_SIZE,
 }
 
 TYPE_NAME = {
@@ -52,7 +57,9 @@ TYPE_NAME = {
     PMD_HOLE: "pmd_hole",
 }
 
-HOT_TYPES = {PTE_ACCESSED, PMD_ACCESSED, PTE_DIRTY, PMD_DIRTY}
+READ_TYPES = {PTE_ACCESSED, PMD_ACCESSED, PUD_PRESENT}
+WRITE_TYPES = {PTE_DIRTY, PMD_DIRTY}
+HOT_TYPES = READ_TYPES | WRITE_TYPES
 COLD_TYPES = {PTE_IDLE, PMD_IDLE, PMD_IDLE_PTES}
 HOLE_TYPES = {PTE_HOLE, PMD_HOLE}
 
@@ -118,12 +125,23 @@ class Stats:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Scan /proc/<pid>/idle_pages and report hot/cold memory distribution."
+        description="Observe etmem_scan idle_pages and report slide-style hot/cold memory distribution."
     )
     parser.add_argument("--pid", type=int, required=True, help="target process PID")
-    parser.add_argument("--interval", type=float, default=10.0, help="seconds between scan rounds")
-    parser.add_argument("--loop", type=int, default=1, help="scan rounds per reported sample")
-    parser.add_argument("--t", type=int, default=1, help="cold threshold: access_count < T is cold")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=10.0,
+        help="seconds before the next reported scan job, matching etmem project interval",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=0.0,
+        help="seconds after each inner scan round, matching etmem project sleep",
+    )
+    parser.add_argument("--loop", type=int, default=1, help="inner scan rounds per reported sample")
+    parser.add_argument("--t", type=int, default=1, help="cold threshold: weighted access_count < T is cold")
     parser.add_argument(
         "--samples",
         type=int,
@@ -135,21 +153,14 @@ def parse_args():
     parser.add_argument("--top", type=int, default=10, help="number of coldest VMAs to print")
     parser.add_argument(
         "--vma-filter",
-        choices=("anon", "rw-private", "all"),
-        default="anon",
-        help="which readable VMAs to scan",
+        choices=("slide-anon", "anon", "rw-private", "all"),
+        default="slide-anon",
+        help="which VMAs to scan; slide-anon follows slide's source-level anonymous VMA rule",
     )
     parser.add_argument("--min-vma-kb", type=int, default=1024, help="skip smaller VMAs")
     parser.add_argument("--csv", help="write summary samples to this CSV file")
     parser.add_argument("--vma-csv", help="write per-VMA rows to this CSV file")
     parser.add_argument("--read-bytes", type=int, default=DEFAULT_READ_BYTES)
-    parser.add_argument("--dirty", action="store_true", help="also request dirty-page classification")
-    parser.add_argument("--huge", action="store_true", help="request huge-page scan mode")
-    parser.add_argument(
-        "--skim-idle",
-        action="store_true",
-        help="request skim-idle mode, where already-idle pages may be skipped",
-    )
     return parser.parse_args()
 
 
@@ -188,13 +199,17 @@ def parse_maps(pid, vma_filter, min_vma_bytes):
                 continue
             address, perms, offset, dev, inode = parts[:5]
             path = parts[5] if len(parts) == 6 else ""
-            if "r" not in perms:
-                continue
-            if path in ("[vvar]", "[vdso]", "[vsyscall]"):
-                continue
             start_s, end_s = address.split("-", 1)
             vma = VMA(int(start_s, 16), int(end_s, 16), perms, offset, dev, inode, path)
             if vma.size < min_vma_bytes:
+                continue
+            if vma_filter == "slide-anon":
+                if is_slide_anonymous_vma(vma):
+                    vmas.append(vma)
+                continue
+            if "r" not in perms:
+                continue
+            if path in ("[vvar]", "[vdso]", "[vsyscall]"):
                 continue
             if vma_filter == "anon" and not is_anonymous_vma(vma):
                 continue
@@ -232,15 +247,19 @@ def is_anonymous_vma(vma):
     return False
 
 
-def open_idle_pages(pid, args):
-    flags = os.O_RDONLY
-    if args.dirty:
-        flags |= getattr(os, "O_NOATIME", 0)
-    if args.huge:
-        flags |= getattr(os, "O_NONBLOCK", 0)
-    if args.skim_idle:
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-    return os.open(f"/proc/{pid}/idle_pages", flags)
+def is_slide_anonymous_vma(vma):
+    may_share = len(vma.perms) > 3 and vma.perms[3] != "p"
+    executable = len(vma.perms) > 2 and vma.perms[2] == "x"
+    writable = len(vma.perms) > 1 and vma.perms[1] == "w"
+    try:
+        inode = int(vma.inode)
+    except ValueError:
+        inode = -1
+    return not may_share and not executable and (inode == 0 or writable)
+
+
+def open_idle_pages(pid, _args):
+    return os.open(f"/proc/{pid}/idle_pages", os.O_RDONLY)
 
 
 def scan_byte_count_for_range(start, end, desired_read_bytes):
@@ -394,10 +413,11 @@ class VMAWindow:
         current_holes = set()
         for start, end, page_type in intervals:
             pages = page_indices(start, end)
-            if page_type in HOT_TYPES:
+            if page_type in READ_TYPES or page_type in WRITE_TYPES:
+                weight = WRITE_WEIGHT if page_type in WRITE_TYPES else READ_WEIGHT
                 for page in pages:
                     self.classifiable_pages.add(page)
-                    self.access_counts[page] = self.access_counts.get(page, 0) + 1
+                    self.access_counts[page] = self.access_counts.get(page, 0) + weight
             elif page_type in COLD_TYPES:
                 self.classifiable_pages.update(pages)
             elif page_type in HOLE_TYPES:
@@ -424,7 +444,6 @@ def scan_process_window(pid, args):
     windows = {idx: VMAWindow() for idx in range(len(vmas))}
 
     for scan_idx in range(args.loop):
-        time.sleep(args.interval)
         fd = open_idle_pages(pid, args)
         try:
             for idx, vma in enumerate(vmas):
@@ -432,6 +451,8 @@ def scan_process_window(pid, args):
                 windows[idx].update(intervals)
         finally:
             os.close(fd)
+        if args.sleep > 0:
+            time.sleep(args.sleep)
 
     total = Stats()
     rows = []
@@ -572,17 +593,24 @@ def main():
     args = parse_args()
     if args.loop < 1:
         raise SystemExit("--loop must be >= 1")
-    if args.t < 1:
-        raise SystemExit("--t must be >= 1")
-    if args.t > args.loop:
-        raise SystemExit("--t must be <= --loop; otherwise every classifiable page is cold")
+    if args.interval < 0:
+        raise SystemExit("--interval must be >= 0")
+    if args.sleep < 0:
+        raise SystemExit("--sleep must be >= 0")
+    if args.t < 0:
+        raise SystemExit("--t must be >= 0")
+    if args.t > args.loop * WRITE_WEIGHT:
+        raise SystemExit("--t must be <= --loop * 3, matching etmem slide's write-access weight")
     if os.geteuid() != 0:
         raise SystemExit("run as root; /proc/<pid>/idle_pages requires elevated privileges")
     ensure_alive(args.pid)
     idle_path = f"/proc/{args.pid}/idle_pages"
     if not os.path.exists(idle_path):
         raise SystemExit(f"{idle_path} does not exist; load etmem_scan or use an etmem-capable kernel")
-    print(f"scan config: loop={args.loop} interval={args.interval}s T={args.t}")
+    print(
+        f"scan config: loop={args.loop} sleep={args.sleep}s interval={args.interval}s "
+        f"T={args.t} weights=read:{READ_WEIGHT},dirty:{WRITE_WEIGHT}"
+    )
 
     summary_f, summary_writer = csv_writer(
         args.csv,
@@ -631,6 +659,8 @@ def main():
         sample_no = 1
         while args.watch or args.samples == 0 or sample_no <= args.samples:
             ensure_alive(args.pid)
+            if args.interval > 0:
+                time.sleep(args.interval)
             total, rows, scanned_vma_rss_kb = scan_process_window(args.pid, args)
             elapsed = time.time() - start_time
             print_summary(sample_no, total, args.pid, elapsed, scanned_vma_rss_kb)
@@ -642,8 +672,6 @@ def main():
             if vma_f:
                 vma_f.flush()
             sample_no += 1
-            if args.watch or args.samples == 0 or sample_no <= args.samples:
-                time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\ninterrupted; exiting monitor")
     finally:
