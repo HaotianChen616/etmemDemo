@@ -85,6 +85,38 @@ sudo python3 ./scan_idle_pages.py \
   --vma-csv /tmp/etmem-scan-vmas.csv
 ```
 
+如果需要把每个 base page 的访问权重和最终冷热判定都输出到 CSV：
+
+```bash
+sudo python3 ./scan_idle_pages.py \
+  --pid <PID> \
+  --warmup \
+  --interval 30 \
+  --samples 1 \
+  --vma-filter slide-anon \
+  --min-vma-kb 0 \
+  --page-csv /tmp/etmem-scan-pages.csv
+```
+
+如果还想看 `loop` 内每一轮扫描看到的页面状态，额外加 `--page-rounds`：
+
+```bash
+sudo python3 ./scan_idle_pages.py \
+  --pid <PID> \
+  --warmup \
+  --loop 3 \
+  --sleep 10 \
+  --interval 30 \
+  --t 2 \
+  --samples 1 \
+  --vma-filter slide-anon \
+  --min-vma-kb 0 \
+  --page-csv /tmp/etmem-scan-pages.csv \
+  --page-rounds
+```
+
+注意：per-page CSV 会非常大。4 GB base page 约 100 万行，每多一个 sample 又追加一批。长时间监控时不要默认打开，只在短时间定位某段 VMA 或抽样分析时使用。
+
 参数建议：
 
 - `--samples`：输出多少次扫描结果，不是内存页数量。
@@ -96,6 +128,9 @@ sudo python3 ./scan_idle_pages.py \
 - 普通旁路观测：也可用更窄的 `--vma-filter anon`
 - QEMU / VM 进程：先用 `--vma-filter rw-private --min-vma-kb 2048`
 - 想看全部可读映射：使用 `--vma-filter all`
+- `--page-csv`：每个 base page 输出一行，包含页地址、最终 hot/cold/other 分类和累计访问权重。
+- `--page-rounds`：配合 `--page-csv` 使用，额外写出每一轮扫描看到的状态，例如 `pte_accessed;pte_idle;pte_dirty`。
+- `--page-include-holes`：配合 `--page-csv` 使用，把 hole/non-present 页也写进明细；通常不建议默认打开。
 - 单轮观察窗口太短时容易把偶发访问误判为热，建议从 `--interval 30` 起步
 
 按当前源码口径观察一个 etmem slide 配置 `loop=3 sleep=10 interval=30 T=2`：
@@ -228,6 +263,22 @@ sudo timeout 1h python3 ./scan_idle_pages.py \
 - `smaps_rss_mb`
 - `scan_rss_ratio`
 - `cold_ratio`
+
+`--page-csv` per-page 字段：
+
+- `sample`
+- `vma_start`
+- `vma_end`
+- `page_addr`
+- `page_index`
+- `page_size_kb`
+- `class`
+- `access_count`
+- `round_states`
+- `perms`
+- `path`
+
+其中 `class` 是按当前样本内累计权重和 `T` 得出的最终分类；`access_count` 是 read/access 权重 `1`、dirty/write 权重 `3` 的累计值；`round_states` 只有打开 `--page-rounds` 时才有值。
 
 ## 7. 如何解读
 

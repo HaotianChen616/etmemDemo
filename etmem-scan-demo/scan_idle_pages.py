@@ -160,6 +160,20 @@ def parse_args():
     parser.add_argument("--min-vma-kb", type=int, default=1024, help="skip smaller VMAs")
     parser.add_argument("--csv", help="write summary samples to this CSV file")
     parser.add_argument("--vma-csv", help="write per-VMA rows to this CSV file")
+    parser.add_argument(
+        "--page-csv",
+        help="write one row per base page with final hot/cold classification and access count",
+    )
+    parser.add_argument(
+        "--page-rounds",
+        action="store_true",
+        help="include per-loop-round page states in --page-csv; can make very large files",
+    )
+    parser.add_argument(
+        "--page-include-holes",
+        action="store_true",
+        help="also include hole/non-present pages in --page-csv",
+    )
     parser.add_argument("--read-bytes", type=int, default=DEFAULT_READ_BYTES)
     return parser.parse_args()
 
@@ -408,8 +422,9 @@ class VMAWindow:
     classifiable_pages: set = field(default_factory=set)
     other_pages: set = field(default_factory=set)
     last_hole_pages: set = field(default_factory=set)
+    round_states: dict = field(default_factory=dict)
 
-    def update(self, intervals):
+    def update(self, intervals, round_idx=None, track_rounds=False):
         current_holes = set()
         for start, end, page_type in intervals:
             pages = page_indices(start, end)
@@ -418,13 +433,25 @@ class VMAWindow:
                 for page in pages:
                     self.classifiable_pages.add(page)
                     self.access_counts[page] = self.access_counts.get(page, 0) + weight
+                    self.record_round_state(page, page_type, round_idx, track_rounds)
             elif page_type in COLD_TYPES:
-                self.classifiable_pages.update(pages)
+                for page in pages:
+                    self.classifiable_pages.add(page)
+                    self.record_round_state(page, page_type, round_idx, track_rounds)
             elif page_type in HOLE_TYPES:
-                current_holes.update(pages)
+                for page in pages:
+                    current_holes.add(page)
+                    self.record_round_state(page, page_type, round_idx, track_rounds)
             else:
-                self.other_pages.update(pages)
+                for page in pages:
+                    self.other_pages.add(page)
+                    self.record_round_state(page, page_type, round_idx, track_rounds)
         self.last_hole_pages = current_holes
+
+    def record_round_state(self, page, page_type, round_idx, track_rounds):
+        if not track_rounds or round_idx is None:
+            return
+        self.round_states.setdefault(page, {})[round_idx] = TYPE_NAME.get(page_type, f"type_{page_type}")
 
     def stats(self, threshold):
         stats = Stats()
@@ -437,18 +464,37 @@ class VMAWindow:
         stats.hole = len(self.last_hole_pages) * PAGE_SIZE
         return stats
 
+    def page_class(self, page, threshold):
+        if page in self.classifiable_pages:
+            if self.access_counts.get(page, 0) >= threshold:
+                return "hot"
+            return "cold"
+        if page in self.other_pages:
+            return "other"
+        if page in self.last_hole_pages:
+            return "hole"
+        return "unknown"
 
-def scan_process_window(pid, args):
+    def iter_pages(self, include_holes):
+        pages = set(self.classifiable_pages)
+        pages.update(self.other_pages - self.classifiable_pages)
+        if include_holes:
+            pages.update(self.last_hole_pages)
+        return sorted(pages)
+
+
+def scan_process_window(pid, args, page_writer=None, sample_no=None):
     vmas = parse_maps(pid, args.vma_filter, args.min_vma_kb * 1024)
     rss_by_range = read_smaps_rss_kb(pid)
     windows = {idx: VMAWindow() for idx in range(len(vmas))}
+    track_rounds = page_writer is not None and args.page_rounds
 
     for scan_idx in range(args.loop):
         fd = open_idle_pages(pid, args)
         try:
             for idx, vma in enumerate(vmas):
                 intervals = scan_vma_intervals(fd, vma, args.read_bytes)
-                windows[idx].update(intervals)
+                windows[idx].update(intervals, scan_idx, track_rounds)
         finally:
             os.close(fd)
         if args.sleep > 0:
@@ -464,6 +510,16 @@ def scan_process_window(pid, args):
         total.merge(stats)
         if stats.total_reported > 0 or vma_rss_kb > 0:
             rows.append((vma, stats, vma_rss_kb))
+        write_page_rows(
+            page_writer,
+            sample_no,
+            vma,
+            windows[idx],
+            args.t,
+            args.loop,
+            args.page_include_holes,
+            args.page_rounds,
+        )
     return total, rows, scanned_vma_rss_kb
 
 
@@ -580,6 +636,34 @@ def write_vma_rows(writer, sample_no, rows):
         )
 
 
+def format_round_states(round_states, loop):
+    if not round_states:
+        return ""
+    return ";".join(round_states.get(idx, "") for idx in range(loop))
+
+
+def write_page_rows(writer, sample_no, vma, window, threshold, loop, include_holes, include_rounds):
+    if writer is None:
+        return
+    for page in window.iter_pages(include_holes):
+        round_states = window.round_states.get(page, {})
+        writer.writerow(
+            {
+                "sample": sample_no,
+                "vma_start": f"{vma.start:x}",
+                "vma_end": f"{vma.end:x}",
+                "page_addr": f"{page * PAGE_SIZE:x}",
+                "page_index": page,
+                "page_size_kb": PAGE_SIZE // 1024,
+                "class": window.page_class(page, threshold),
+                "access_count": window.access_counts.get(page, 0),
+                "round_states": format_round_states(round_states, loop) if include_rounds else "",
+                "perms": vma.perms,
+                "path": vma.label,
+            }
+        )
+
+
 def ensure_alive(pid):
     try:
         os.kill(pid, 0)
@@ -601,6 +685,10 @@ def main():
         raise SystemExit("--t must be >= 0")
     if args.t > args.loop * WRITE_WEIGHT:
         raise SystemExit("--t must be <= --loop * 3, matching etmem slide's write-access weight")
+    if args.page_rounds and not args.page_csv:
+        raise SystemExit("--page-rounds requires --page-csv")
+    if args.page_include_holes and not args.page_csv:
+        raise SystemExit("--page-include-holes requires --page-csv")
     if os.geteuid() != 0:
         raise SystemExit("run as root; /proc/<pid>/idle_pages requires elevated privileges")
     ensure_alive(args.pid)
@@ -649,6 +737,22 @@ def main():
             "cold_ratio",
         ),
     )
+    page_f, page_writer = csv_writer(
+        args.page_csv,
+        (
+            "sample",
+            "vma_start",
+            "vma_end",
+            "page_addr",
+            "page_index",
+            "page_size_kb",
+            "class",
+            "access_count",
+            "round_states",
+            "perms",
+            "path",
+        ),
+    )
 
     start_time = time.time()
     try:
@@ -661,7 +765,7 @@ def main():
             ensure_alive(args.pid)
             if args.interval > 0:
                 time.sleep(args.interval)
-            total, rows, scanned_vma_rss_kb = scan_process_window(args.pid, args)
+            total, rows, scanned_vma_rss_kb = scan_process_window(args.pid, args, page_writer, sample_no)
             elapsed = time.time() - start_time
             print_summary(sample_no, total, args.pid, elapsed, scanned_vma_rss_kb)
             print_top_vmas(rows, args.top)
@@ -671,6 +775,8 @@ def main():
                 summary_f.flush()
             if vma_f:
                 vma_f.flush()
+            if page_f:
+                page_f.flush()
             sample_no += 1
     except KeyboardInterrupt:
         print("\ninterrupted; exiting monitor")
@@ -679,6 +785,8 @@ def main():
             summary_f.close()
         if vma_f:
             vma_f.close()
+        if page_f:
+            page_f.close()
     return 0
 
 
